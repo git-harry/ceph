@@ -166,6 +166,7 @@ void PGMap::apply_incremental(CephContext *cct, const Incremental& inc)
   stamp = inc.stamp;
 
   pool_stat_t pg_sum_old = pg_sum;
+  hash_map<uint64_t, pool_stat_t> pg_pool_sum_old;
 
   bool ratios_changed = false;
   if (inc.full_ratio != full_ratio && inc.full_ratio != -1) {
@@ -185,6 +186,9 @@ void PGMap::apply_incremental(CephContext *cct, const Incremental& inc)
     const pg_t &update_pg(p->first);
     const pg_stat_t &update_stat(p->second);
 
+    if (pg_pool_sum_old.count(update_pg.pool()) == 0)
+      pg_pool_sum_old[update_pg.pool()] = pg_pool_sum[update_pg.pool()];
+
     hash_map<pg_t,pg_stat_t>::iterator t = pg_stat.find(update_pg);
     if (t == pg_stat.end()) {
       hash_map<pg_t,pg_stat_t>::value_type v(update_pg, update_stat);
@@ -200,7 +204,7 @@ void PGMap::apply_incremental(CephContext *cct, const Incremental& inc)
        ++p) {
     int osd = p->first;
     const osd_stat_t &new_stats(p->second);
-    
+
     hash_map<int32_t,osd_stat_t>::iterator t = osd_stat.find(osd);
     if (t == osd_stat.end()) {
       hash_map<int32_t,osd_stat_t>::value_type v(osd, new_stats);
@@ -211,7 +215,7 @@ void PGMap::apply_incremental(CephContext *cct, const Incremental& inc)
     }
 
     stat_osd_add(new_stats);
-    
+
     // adjust [near]full status
     register_nearfull_status(osd, new_stats);
   }
@@ -225,7 +229,7 @@ void PGMap::apply_incremental(CephContext *cct, const Incremental& inc)
       pg_stat.erase(s);
     }
   }
-  
+
   for (set<int>::iterator p = inc.osd_stat_rm.begin();
        p != inc.osd_stat_rm.end();
        ++p) {
@@ -252,7 +256,9 @@ void PGMap::apply_incremental(CephContext *cct, const Incremental& inc)
     stamp_delta -= pg_sum_deltas.front().second;
     pg_sum_deltas.pop_front();
   }
-  
+
+  update_pool_deltas(cct, inc.stamp, pg_pool_sum_old);
+
   if (inc.osdmap_epoch)
     last_osdmap_epoch = inc.osdmap_epoch;
   if (inc.pg_scan)
@@ -799,24 +805,107 @@ void PGMap::recovery_rate_summary(Formatter *f, ostream *out) const
   }
 }
 
-void PGMap::update_delta(CephContext *cct, utime_t inc_stamp, pool_stat_t& pg_sum_old)
+
+/**
+ * update aggregated delta
+ *
+ * @param cct            ceph context
+ * @param ts             Timestamp
+ * @param pg_sum_old     Old pg_sum
+ */
+void PGMap::update_delta(CephContext *cct,
+                         const utime_t ts, const pool_stat_t& pg_sum_old)
 {
+  /* @p ts is the timestamp we want to associate with the data
+   * in @p pg_sum_old, and on which we will base ourselves to calculate
+   * the delta, store in 'delta_t'.
+   */
   utime_t delta_t;
-  delta_t = inc_stamp;
-  delta_t -= stamp;
-  stamp = inc_stamp;
+  delta_t = ts;     // start with the provided timestamp
+  delta_t -= stamp; // take the last timestamp we saw
+  stamp = ts;       // @p ts becomes the last timestamp we saw
 
   // calculate a delta, and average over the last 2 deltas.
+  /* start by taking a copy of our current @p pg_sum and taking out the
+   * stats from @p pg_sum_old.  This generates a stats delta.  Stash this
+   * stats delta in 'pg_sum_deltas', along with the timestamp delta for these
+   * results.
+   */
   pool_stat_t d = pg_sum;
   d.stats.sub(pg_sum_old.stats);
   pg_sum_deltas.push_back(make_pair(d, delta_t));
   stamp_delta += delta_t;
 
+  /* Aggregate current delta, and take out the last seen delta (if any) to
+   * average it out.
+   * All our work is meant to keep pg_sum_delta happy and healthy.
+   */
   pg_sum_delta.stats.add(d.stats);
-  if (pg_sum_deltas.size() > (std::list< pair<pool_stat_t, utime_t> >::size_type)MAX(1, cct ? cct->_conf->mon_stat_smooth_intervals : 1)) {
+  if (pg_sum_deltas.size() > (size_t)MAX(1, cct ? cct->_conf->mon_stat_smooth_intervals : 1)) {
     pg_sum_delta.stats.sub(pg_sum_deltas.front().first.stats);
     stamp_delta -= pg_sum_deltas.front().second;
     pg_sum_deltas.pop_front();
+  }
+}
+
+/**
+ * Update a given pool's deltas
+ *
+ * @param cct           Ceph Context
+ * @param ts            Timestamp for the stats being delta'ed
+ * @param pool          Pool's id
+ * @param old_pool_sum  Previous stats sum
+ */
+void PGMap::update_one_pool_delta(CephContext *cct,
+                                  const utime_t ts,
+                                  const uint64_t pool,
+                                  const pool_stat_t& old_pool_sum)
+{
+
+  /* This function follows the same rationale as @fn update_delta.
+   * Please check mon/PGMap.h for descriptions on each variable here
+   * used, as they differ from those used on @fn update_delta.
+   */
+
+  if (per_pool_sum_deltas.count(pool) == 0) {
+    assert(per_pool_sum_deltas_stamps.count(pool) == 0);
+    assert(per_pool_sum_delta.count(pool) == 0);
+  }
+
+  pair<pool_stat_t,utime_t>& sum_delta = per_pool_sum_delta[pool];
+
+  utime_t delta_t;
+  delta_t = ts;
+  delta_t -= sum_delta.second;
+  sum_delta.second = ts;
+
+  pool_stat_t d = pg_pool_sum[pool];
+  d.stats.sub(old_pool_sum.stats);
+  per_pool_sum_deltas[pool].push_back(make_pair(d, delta_t));
+  per_pool_sum_deltas_stamps[pool] += delta_t;
+
+  sum_delta.first.stats.add(d.stats);
+  size_t s = MAX(1, cct ? cct->_conf->mon_stat_smooth_intervals : 1);
+  if (per_pool_sum_deltas[pool].size() > s) {
+    sum_delta.first.stats.sub(per_pool_sum_deltas[pool].front().first.stats);
+    per_pool_sum_deltas_stamps[pool] -= per_pool_sum_deltas[pool].front().second;
+    per_pool_sum_deltas[pool].pop_front();
+  }
+}
+
+/**
+ * Update pools' deltas
+ *
+ * @param cct               CephContext
+ * @param ts                Timestamp for the stats being delta'ed
+ * @param pg_pool_sum_old   Map of pool stats for delta calcs.
+ */
+void PGMap::update_pool_deltas(CephContext *cct, const utime_t ts,
+                               const hash_map<uint64_t,pool_stat_t>& pg_pool_sum_old)
+{
+  for (hash_map<uint64_t,pool_stat_t>::const_iterator it = pg_pool_sum_old.begin();
+       it != pg_pool_sum_old.end(); ++it) {
+    update_one_pool_delta(cct, ts, it->first, it->second);
   }
 }
 
