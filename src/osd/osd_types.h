@@ -18,15 +18,17 @@
 #include <sstream>
 #include <stdio.h>
 #include <memory>
+#include <boost/scoped_ptr.hpp>
 
 #include "msg/msg_types.h"
 #include "include/types.h"
 #include "include/utime.h"
 #include "include/CompatSet.h"
 #include "include/interval_set.h"
-#include "common/snap_types.h"
 #include "common/Formatter.h"
+#include "common/bloom_filter.hpp"
 #include "common/hobject.h"
+#include "common/snap_types.h"
 #include "Watch.h"
 
 #define CEPH_OSD_ONDISK_MAGIC "ceph osd volume v026"
@@ -1932,6 +1934,173 @@ struct pg_create_t {
   static void generate_test_instances(list<pg_create_t*>& o);
 };
 WRITE_CLASS_ENCODER(pg_create_t)
+
+// -----------------------------------------
+
+/// abstract interface for a HitSet implementation
+class HitSetImpl {
+public:
+  virtual void insert(uint32_t hash) = 0;
+  virtual bool contains(uint32_t hash) const = 0;
+  virtual void encode(bufferlist &bl) const = 0;
+  virtual void decode(bufferlist::iterator& p) = 0;
+  virtual void dump(Formatter *f) const = 0;
+  virtual ~HitSetImpl() = 0;
+};
+
+/**
+ * explicitly enumerate hash hits in the set
+ */
+class ExplicitHitSet : public HitSetImpl {
+  hash_set<uint32_t> hits;
+public:
+  void insert(uint32_t hash) {
+    hits.insert(hash);
+  }
+  bool contains(uint32_t hash) const {
+    return hits.count(hash);
+  }
+  void encode(bufferlist &bl) const {
+    ::encode(hits, bl);
+  }
+  void decode(bufferlist::iterator &bl) {
+    ::decode(hits, bl);
+  }
+  void dump(Formatter *f) const {
+    f->open_array_section("hash_set");
+    for (hash_set<uint32_t>::const_iterator p = hits.begin(); p != hits.end(); ++p)
+      f->dump_unsigned("hash", *p);
+    f->close_section();
+  }
+  static void generate_test_instances(list<ExplicitHitSet*>& o) {
+    o.push_back(new ExplicitHitSet);
+    o.push_back(new ExplicitHitSet);
+    o.back()->insert(1);
+    o.back()->insert(12);
+    o.back()->insert(123);
+  }
+};
+WRITE_CLASS_ENCODER(ExplicitHitSet)
+
+/**
+ * use a bloom_filter to track hits to the set
+ */
+class BloomHitSet : public HitSetImpl {
+  bloom_filter bloom;
+
+public:
+  BloomHitSet() {}
+  BloomHitSet(unsigned inserts, double fpp, int seed)
+    : bloom(inserts, fpp, seed)
+  {}
+
+  void insert(uint32_t hash) {
+    bloom.insert(hash);
+  }
+  bool contains(uint32_t hash) const {
+    return bloom.contains(hash);
+  }
+
+  void encode(bufferlist &bl) const {
+    ENCODE_START(1, 1, bl);
+    ::encode(bloom, bl);
+    ENCODE_FINISH(bl);
+  }
+  void decode(bufferlist::iterator &bl) {
+    DECODE_START(1, bl);
+    ::decode(bloom, bl);
+    DECODE_FINISH(bl);
+  }
+  void dump(Formatter *f) const {
+    f->open_object_section("bloom_filter");
+    bloom.dump(f);
+    f->close_section();
+  }
+  static void generate_test_instances(list<BloomHitSet*>& o) {
+    o.push_back(new BloomHitSet);
+    o.push_back(new BloomHitSet(10, .1, 1));
+    o.back()->insert(1);
+    o.back()->insert(12);
+    o.back()->insert(123);
+  }
+};
+WRITE_CLASS_ENCODER(BloomHitSet)
+
+/**
+ * generic container for a HitSet
+ *
+ * Encapsulate a HitSetImpl of any type.  Expose a generic interface
+ * to users and wrap the encoded object with a type so that it can be
+ * safely decoded later.
+ */
+class HitSet {
+public:
+  typedef enum {
+    TYPE_NONE = 0,
+    TYPE_EXPLICIT = 1,
+    TYPE_BLOOM = 2
+  } type_t;
+
+  type_t type;
+  boost::scoped_ptr<HitSetImpl> impl;
+
+  HitSet() : type(TYPE_NONE), impl(NULL) {}
+  HitSet(type_t t, HitSetImpl *i) : type(t), impl(i) {}
+
+  /// insert a hash into the set
+  void insert(uint32_t hash) {
+    impl->insert(hash);
+  }
+
+  /// query whether a hash is in the set
+  bool contains(uint32_t hash) const {
+    return impl->contains(hash);
+  }
+
+  void encode(bufferlist &bl) const {
+    ENCODE_START(1, 1, bl);
+    __u8 t = type;
+    ::encode(t, bl);
+    impl->encode(bl);
+    ENCODE_FINISH(bl);
+  }
+  void decode(bufferlist::iterator &bl) {
+    DECODE_START(1, bl);
+    __u8 t;
+    ::decode(t, bl);
+    type = (type_t)t;
+    switch (type) {
+    case TYPE_EXPLICIT:
+      impl.reset(new ExplicitHitSet);
+      break;
+    case TYPE_BLOOM:
+      impl.reset(new BloomHitSet);
+      break;
+    case TYPE_NONE:
+      impl.reset(NULL);
+      break;
+    default:
+      throw buffer::malformed_input("unrecognized HitMap type");
+    }
+    impl->decode(bl);
+    DECODE_FINISH(bl);
+  }
+  void dump(Formatter *f) {
+    impl->dump(f);
+  }
+  static void generate_test_instances(list<HitSet*>& o) {
+    o.push_back(new HitSet);
+    o.push_back(new HitSet(HitSet::TYPE_BLOOM, new BloomHitSet(10, .1, 1)));
+    o.back()->insert(1);
+    o.back()->insert(12);
+    o.back()->insert(123);
+    o.push_back(new HitSet(HitSet::TYPE_EXPLICIT, new ExplicitHitSet));
+    o.back()->insert(1);
+    o.back()->insert(12);
+    o.back()->insert(123);
+  }
+};
+WRITE_CLASS_ENCODER(HitSet);
 
 // -----------------------------------------
 
